@@ -13,7 +13,7 @@ readonly BACKUP_DIR="/var/lib/privacy-suite/backups"
 readonly LOG_FILE="/var/log/privacy-suite.log"
 readonly FIREJAIL_PROFILES="$HOME/.config/firejail"
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-readonly REQUIRED_PKGS=(tor proxychains4 firejail wireguard tcpdump wireshark)
+#readonly REQUIRED_PKGS=(tor proxychains4 firejail wireguard tcpdump wireshark)
 readonly REQUIRED_PKGS=(tor proxychains4 wireguard tcpdump wireshark git build-essential)
 
 # Colors
