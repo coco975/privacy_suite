@@ -1,177 +1,200 @@
 #!/bin/bash
-# Ultimate Anonymity Toolkit v2.1
-# Full-featured security suite with automatic configuration
-# License: GPL-3.0
-# Usage: ./anonymizer.sh [command]
+# Ultimate Privacy Suite v5.0
+# Complete Anonymous Computing Environment
+# License: AGPL-3.0
 
-set -euo pipefail
-shopt -s nullglob
+set -eo pipefail
+shopt -s inherit_errexit nullglob
 
 # Configuration
-readonly BACKUP_DIR="/etc/anonymizer/backups"
+readonly TOR_CONFIG="/etc/tor/torrc"
+readonly PROXYCHAINS_CONFIG="/etc/proxychains4.conf"
+readonly BACKUP_DIR="/var/lib/privacy-suite/backups"
+readonly LOG_FILE="/var/log/privacy-suite.log"
+readonly FIREJAIL_PROFILES="$HOME/.config/firejail"
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-readonly CONFIG_FILES=(
-    "/etc/proxychains.conf"
-    "/etc/tor/torrc"
-    "/etc/resolv.conf"
-)
-readonly COLOR_ERR='\033[0;31m'
-readonly COLOR_WARN='\033[0;33m'
-readonly COLOR_INFO='\033[0;36m'
-readonly COLOR_RESET='\033[0m'
+readonly REQUIRED_PKGS=(tor proxychains4 firejail wireguard tcpdump wireshark)
 
-# Core Functions
-create_backup() {
-    echo -e "${COLOR_INFO}Creating system snapshot...${COLOR_RESET}"
-    local backup_path="${BACKUP_DIR}/${TIMESTAMP}"
-    mkdir -p "${backup_path}"
-    
-    # Backup config files
-    for file in "${CONFIG_FILES[@]}"; do
-        if [[ -f "$file" ]]; then
-            cp --parents "$file" "$backup_path"
-        fi
-    done
+# Colors
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m'
 
-    # Backup package states
-    dpkg --get-selections > "${backup_path}/package_states.txt"
-    
-    echo -e "Backup created: ${backup_path}"
+# Logging
+log() {
+    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')] $1${NC}" | tee -a "$LOG_FILE"
 }
 
-restore_system() {
-    echo -e "${COLOR_INFO}Available backups:${COLOR_RESET}"
-    local backups=("${BACKUP_DIR}"/*)
-    for ((i=0; i<${#backups[@]}; i++)); do
-        echo "$i: ${backups[$i]##*/}"
-    done
+# Error Handler
+error_handler() {
+    local lineno=$1
+    local msg=$2
+    log "${RED}Error on line $lineno: $msg${NC}"
+    log "${YELLOW}Attempting rollback...${NC}"
+    restore_backup
+    exit 1
+}
+
+trap 'error_handler ${LINENO} "$BASH_COMMAND"' ERR
+
+# Backup System
+backup_system() {
+    log "Creating system backup..."
+    local backup_path="$BACKUP_DIR/$TIMESTAMP"
+    mkdir -p "$backup_path"
     
-    read -p "Select backup: " num
-    local selected="${backups[$num]}"
-    
-    echo -e "${COLOR_WARN}Restoring system state...${COLOR_RESET}"
-    rsync -av "${selected}/" /
-    dpkg --set-selections < "${selected}/package_states.txt"
+    cp --parents "$TOR_CONFIG" "$PROXYCHAINS_CONFIG" "$backup_path"
+    dpkg --get-selections > "$backup_path/pkg-list.txt"
+    log "Backup created: ${backup_path}"
+}
+
+restore_backup() {
+    local latest=$(ls -td "$BACKUP_DIR"/*/ | head -1)
+    log "Restoring from ${latest}..."
+    rsync -av "$latest/" /
+    dpkg --clear-selections
+    dpkg --set-selections < "$latest/pkg-list.txt"
     apt-get dselect-upgrade -y
+    systemctl daemon-reload
 }
 
-install_stack() {
-    echo -e "${COLOR_INFO}Installing core components...${COLOR_RESET}"
-    apt update && apt install -y \
-        git build-essential autoconf libtool \
-        tor firejail wireguard tcpdump
+# VPN Configuration
+configure_vpn() {
+    log "${GREEN}VPN Setup${NC}"
+    local vpn_file=""
     
-    # Build latest proxychains-ng
-    git clone https://github.com/rofl0r/proxychains-ng
-    pushd proxychains-ng
-    ./configure --prefix=/usr --sysconfdir=/etc
-    make && make install
-    popd
+    while true; do
+        read -p "Enter path to WireGuard config: " vpn_file
+        if [[ -f "$vpn_file" && "$vpn_file" =~ \.conf$ ]]; then
+            break
+        fi
+        log "${RED}Invalid config. Must be .conf file${NC}"
+    done
+
+    local config_name=$(basename "$vpn_file")
+    cp "$vpn_file" "/etc/wireguard/"
+    systemctl enable "wg-quick@${config_name%.*}"
+    systemctl start "wg-quick@${config_name%.*}"
     
-    # Configure network stack
-    configure_tor
-    configure_proxychains
-    test_connectivity
+    # VPN Killswitch
+    iptables -A OUTPUT -o "$(ip link show | awk -F': ' '/^[0-9]+: wg/ {print $2}')" -j ACCEPT
+    iptables -A OUTPUT -j DROP
 }
 
+# Tor Network Setup
 configure_tor() {
-    echo -e "${COLOR_INFO}Hardening Tor configuration...${COLOR_RESET}"
-    cat >> /etc/tor/torrc <<EOF
-VirtualAddrNetwork 10.192.0.0/10
-AutomapHostsOnResolve 1
+    log "${GREEN}Configuring Tor${NC}"
+    cat > "$TOR_CONFIG" <<EOF
+SocksPort 9050
+ControlPort 9051
 TransPort 9040
 DNSPort 5353
+AvoidDiskWrites 1
+HardwareAccel 1
 EOF
-    systemctl restart tor
+
+    if [[ "$ADD_BRIDGES" == "y" ]]; then
+        log "Adding Tor bridges..."
+        cat >> "$TOR_CONFIG" <<EOF
+UseBridges 1
+Bridge obfs4 193.11.166.194:27015 2B280B23E1107BB62ABFC40DDCC8824814F80A72
+Bridge obfs4 109.105.109.162:10527 D9B3ECEE9C1C7B857C9A4C44E8A39173A6B9A1A5
+EOF
+    fi
+    systemctl restart tor@default
 }
 
+# Proxychains Setup
 configure_proxychains() {
-    local conf_file="/etc/proxychains.conf"
-    echo -e "${COLOR_INFO}Optimizing proxy chain...${COLOR_RESET}"
-    sed -i.bak '
-        s/^strict_chain/#strict_chain/;
-        s/^#dynamic_chain/dynamic_chain/;
-        s/^#proxy_dns/proxy_dns/;
-        /socks4\s\+127\.0\.0\.1\s\+9050/d;
-    ' "$conf_file"
-    echo "socks5 127.0.0.1 9050" >> "$conf_file"
+    log "${GREEN}Configuring Proxychains${NC}"
+    sed -i '/^strict_chain\|^random_chain/d' "$PROXYCHAINS_CONFIG"
+    echo "dynamic_chain" >> "$PROXYCHAINS_CONFIG"
+    echo "proxy_dns" >> "$PROXYCHAINS_CONFIG"
+    sed -i '/^socks4\|^socks5/d' "$PROXYCHAINS_CONFIG"
+    echo "socks5 127.0.0.1 9050" >> "$PROXYCHAINS_CONFIG"
 }
 
-# Verification
-test_connectivity() {
-    echo -e "${COLOR_INFO}Running security checks...${COLOR_RESET}"
-    if ! torsocks curl -s https://check.torproject.org | grep -q "Congratulations"; then
-        echo -e "${COLOR_ERR}Tor connectivity test failed!${COLOR_RESET}"
-        exit 1
-    fi
-    
-    if ! proxychains curl -s ifconfig.me >/dev/null; then
-        echo -e "${COLOR_ERR}Proxychains test failed!${COLOR_RESET}"
-        exit 1
-    fi
-}
+# Firejail Sandboxing
+create_sandbox_profile() {
+    local app=$1
+    log "Creating sandbox profile for ${app}..."
+    mkdir -p "$FIREJAIL_PROFILES"
+    cat > "$FIREJAIL_PROFILES/${app}.profile" <<EOF
+include /etc/firejail/${app}.profile
 
-# Usage Manual
-show_manual() {
-    cat <<EOF
-
-Ultimate Anonymity Toolkit - Usage Manual
-
-Basic Commands:
-  install       - Full installation
-  restore       - Restore previous configuration
-  update        - Update components
-  vpn-config    - Setup VPN integration
-  sandbox       - Launch sandboxed application
-
-Advanced OPSEC:
-1. Always combine with VPN:
-   $ ./anonymizer.sh vpn-config --provider mullvad
-
-2. Use Firejail containment:
-   $ ./anonymizer.sh sandbox --browser firefox
-
-3. Regular maintenance:
-   $ ./anonymizer.sh update --security-only
-
-4. Network monitoring:
-   $ ./anonymizer.sh monitor --interface eth0
-
-Security Best Practices:
-- Chain Tor over VPN for entry guards
-- Use application-specific firejail profiles
-- Monitor DNS leaks weekly
-- Verify PGP signatures on updates
-- Restrict physical device access
-
-Connection Diagram:
-  [App] → [Firejail] → [Proxychains] → [Tor] → [VPN] → Internet
-
+noblacklist ~/.config
+netfilter
+noexec=~/Downloads
+seccomp
+caps.drop all
+private-dev
+private-tmp
 EOF
 }
 
-# Main Execution
-case "${1:-}" in
-    install)
-        create_backup
-        install_stack
-        ;;
-    restore)
-        restore_system
-        ;;
-    update)
-        git -C proxychains-ng pull
-        systemctl restart tor
-        ;;
-    vpn-config)
-        shift
-        configure_vpn "$@"
-        ;;
-    sandbox)
-        shift
-        launch_sandbox "$@"
-        ;;
-    *)
-        show_manual
-        ;;
-esac
+# Validation System
+validate_network() {
+    log "${GREEN}Starting Network Validation${NC}"
+    local capture_file="/tmp/leaktest_${TIMESTAMP}.pcap"
+    local report_file="/tmp/leakreport_${TIMESTAMP}.txt"
+
+    log "Capturing network traffic for 300 seconds..."
+    timeout 300 tcpdump -ni any -w "$capture_file" &
+    
+    log "Testing Tor connectivity..."
+    if ! torsocks curl -s https://check.torproject.org | grep -q "Congratulations"; then
+        log "${RED}Tor Connection Failed!${NC}"
+        return 1
+    fi
+
+    log "Testing Proxychains..."
+    if ! proxychains curl -s https://ifconfig.me >/dev/null; then
+        log "${RED}Proxychains Failure!${NC}"
+        return 1
+    fi
+
+    log "Analyzing traffic..."
+    tshark -r "$capture_file" -Y "tcp.port != 9050" > "$report_file"
+    log "Validation Report: ${YELLOW}${report_file}${NC}"
+}
+
+# Main Installation
+main() {
+    log "${GREEN}Starting Privacy Suite Installation${NC}"
+    backup_system
+
+    # Install Dependencies
+    apt update && apt install -y "${REQUIRED_PKGS[@]}"
+
+    # VPN Setup
+    read -p "Configure VPN? [y/N]: " vpn_choice
+    if [[ "$vpn_choice" =~ ^[Yy] ]]; then
+        configure_vpn
+    fi
+
+    # Tor Bridges
+    read -p "Add Tor Bridges? [y/N]: " ADD_BRIDGES
+
+    # Configure Services
+    configure_tor
+    configure_proxychains
+
+    # Optional Features
+    read -p "Enable Random Proxy Chaining? [y/N]: " random_chain
+    [[ "$random_chain" =~ ^[Yy] ]] && sed -i 's/dynamic_chain/random_chain/' "$PROXYCHAINS_CONFIG"
+
+    # Validation
+    validate_network
+
+    log "${GREEN}Installation Complete!${NC}"
+}
+
+# Execution
+if [[ $EUID -ne 0 ]]; then
+    log "${RED}Run as root: sudo $0${NC}"
+    exit 1
+fi
+
+main "$@"
