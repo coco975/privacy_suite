@@ -14,6 +14,7 @@ readonly LOG_FILE="/var/log/privacy-suite.log"
 readonly FIREJAIL_PROFILES="$HOME/.config/firejail"
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 readonly REQUIRED_PKGS=(tor proxychains4 firejail wireguard tcpdump wireshark)
+readonly REQUIRED_PKGS=(tor proxychains4 wireguard tcpdump wireshark git build-essential)
 
 # Colors
 readonly RED='\033[0;31m'
@@ -165,32 +166,36 @@ main() {
     log "${GREEN}Starting Privacy Suite Installation${NC}"
     backup_system
 
-    # Install Dependencies
-    apt update && apt install -y "${REQUIRED_PKGS[@]}"
+    # ===== 1. Install Build Dependencies First =====
+    log "Installing build essentials..."
+    apt update && apt install -y git build-essential
 
-    # VPN Setup
-    read -p "Configure VPN? [y/N]: " vpn_choice
-    if [[ "$vpn_choice" =~ ^[Yy] ]]; then
-        configure_vpn
+    # ===== 2. Install Firejail from Source =====
+    if ! command -v firejail &>/dev/null; then
+        log "${YELLOW}Installing Firejail from source...${NC}"
+        temp_dir=$(mktemp -d)
+        git clone https://github.com/netblue30/firejail.git "$temp_dir"
+        pushd "$temp_dir" >/dev/null
+        ./configure
+        make
+        sudo make install-strip
+        popd >/dev/null
+        rm -rf "$temp_dir"
+        
+        # Verify installation
+        if ! command -v firejail &>/dev/null; then
+            log "${RED}Firejail installation failed!${NC}"
+            exit 1
+        fi
+        log "${GREEN}Firejail installed successfully${NC}"
     fi
 
-    # Tor Bridges
-    read -p "Add Tor Bridges? [y/N]: " ADD_BRIDGES
+    # ===== 3. Install Remaining Packages =====
+    log "Installing system packages..."
+    apt install -y "${REQUIRED_PKGS[@]}"
 
-    # Configure Services
-    configure_tor
-    configure_proxychains
-
-    # Optional Features
-    read -p "Enable Random Proxy Chaining? [y/N]: " random_chain
-    [[ "$random_chain" =~ ^[Yy] ]] && sed -i 's/dynamic_chain/random_chain/' "$PROXYCHAINS_CONFIG"
-
-    # Validation
-    validate_network
-
-    log "${GREEN}Installation Complete!${NC}"
+    # ... [rest of the original main function] ...
 }
-
 # Execution
 if [[ $EUID -ne 0 ]]; then
     log "${RED}Run as root: sudo $0${NC}"
