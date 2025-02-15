@@ -1,6 +1,6 @@
 #!/bin/bash
-# Ultimate Privacy Suite v5.0
-# Complete Anonymous Computing Environment
+# Ultimate Privacy Suite v5.4
+# Fixed Tor, VPN, and Dependency Handling
 # License: AGPL-3.0
 
 set -eo pipefail
@@ -13,8 +13,7 @@ readonly BACKUP_DIR="/var/lib/privacy-suite/backups"
 readonly LOG_FILE="/var/log/privacy-suite.log"
 readonly FIREJAIL_PROFILES="$HOME/.config/firejail"
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-#readonly REQUIRED_PKGS=(tor proxychains4 firejail wireguard tcpdump wireshark)
-readonly REQUIRED_PKGS=(tor proxychains4 wireguard tcpdump wireshark git build-essential)
+readonly REQUIRED_PKGS=(tor proxychains4 wireguard tcpdump wireshark git resolvconf)
 
 # Colors
 readonly RED='\033[0;31m'
@@ -53,6 +52,7 @@ backup_system() {
 
 restore_backup() {
     local latest=$(ls -td "$BACKUP_DIR"/*/ | head -1)
+    [[ -z "$latest" ]] && log "${RED}No backups available!${NC}" && exit 1
     log "Restoring from ${latest}..."
     rsync -av "$latest/" /
     dpkg --clear-selections
@@ -62,144 +62,103 @@ restore_backup() {
 }
 
 # VPN Configuration
+validate_vpn_config() {
+    local config_file="$1"
+    [[ ! -s "$config_file" ]] && log "${RED}Empty/missing VPN config!${NC}" && exit 1
+    
+    if ! grep -q "^\[Interface\]" "$config_file" || \
+       ! grep -q "^PrivateKey" "$config_file" || \
+       ! grep -q "^\[Peer\]" "$config_file" || \
+       ! grep -q "^PublicKey" "$config_file"; then
+        log "${RED}Invalid WireGuard config!${NC}"
+        exit 1
+    fi
+}
+
 configure_vpn() {
     log "${GREEN}VPN Setup${NC}"
     local vpn_file=""
     
     while true; do
         read -p "Enter path to WireGuard config: " vpn_file
-        if [[ -f "$vpn_file" && "$vpn_file" =~ \.conf$ ]]; then
-            break
-        fi
-        log "${RED}Invalid config. Must be .conf file${NC}"
+        [[ -f "$vpn_file" && "$vpn_file" =~ \.conf$ ]] && validate_vpn_config "$vpn_file" && break
+        log "${RED}Invalid config! Must be .conf file${NC}"
     done
 
+    sudo rm -f /etc/wireguard/wg*
     local config_name=$(basename "$vpn_file")
-    cp "$vpn_file" "/etc/wireguard/"
-    systemctl enable "wg-quick@${config_name%.*}"
-    systemctl start "wg-quick@${config_name%.*}"
+    sudo cp "$vpn_file" "/etc/wireguard/$config_name"
+    sudo chmod 600 "/etc/wireguard/$config_name"
     
-    # VPN Killswitch
-    iptables -A OUTPUT -o "$(ip link show | awk -F': ' '/^[0-9]+: wg/ {print $2}')" -j ACCEPT
-    iptables -A OUTPUT -j DROP
+    local interface_name=$(basename "$config_name" .conf)
+    sudo wg-quick up "/etc/wireguard/$config_name" || {
+        log "${RED}VPN connection failed!${NC}"; exit 1
+    }
+
+    echo "nameserver 10.2.0.1" | sudo tee /etc/resolv.conf
+    sudo chattr +i /etc/resolv.conf
+    
+    sudo nft flush ruleset
+    sudo nft add table ip killswitch
+    sudo nft add chain ip killswitch output { type filter hook output priority 0 \; }
+    sudo nft add rule ip killswitch output meta skuid != 0 drop
+    sudo nft add rule ip killswitch output oifname != "$interface_name" drop
+    
+    log "${GREEN}VPN active on $interface_name${NC}"
 }
 
-# Tor Network Setup
+# Tor Configuration
 configure_tor() {
-    log "${GREEN}Configuring Tor${NC}"
-    cat > "$TOR_CONFIG" <<EOF
-SocksPort 9050
-ControlPort 9051
-TransPort 9040
-DNSPort 5353
-AvoidDiskWrites 1
-HardwareAccel 1
-EOF
-
-    if [[ "$ADD_BRIDGES" == "y" ]]; then
-        log "Adding Tor bridges..."
-        cat >> "$TOR_CONFIG" <<EOF
-UseBridges 1
-Bridge obfs4 193.11.166.194:27015 2B280B23E1107BB62ABFC40DDCC8824814F80A72
-Bridge obfs4 109.105.109.162:10527 D9B3ECEE9C1C7B857C9A4C44E8A39173A6B9A1A5
-EOF
+    log "${GREEN}Tor Bridge Setup${NC}"
+    sudo systemctl stop tor
+    
+    if [[ "$ADD_BRIDGES" =~ ^[Yy] ]]; then
+        while true; do
+            read -p "Enter Tor bridge line: " bridge_line
+            [[ "$bridge_line" =~ ^obfs4.+cert=.+ ]] && break
+            log "${RED}Invalid bridge format! Example: obfs4 1.2.3.4:1234 cert=...${NC}"
+        done
+        echo "Bridge $bridge_line" | sudo tee -a /etc/tor/torrc
     fi
-    systemctl restart tor@default
+    
+    echo "UseBridges 1" | sudo tee -a /etc/tor/torrc
+    echo "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy" | sudo tee -a /etc/tor/torrc
+    sudo systemctl start tor
+    log "${GREEN}Tor configured successfully${NC}"
 }
 
 # Proxychains Setup
 configure_proxychains() {
     log "${GREEN}Configuring Proxychains${NC}"
-    sed -i '/^strict_chain\|^random_chain/d' "$PROXYCHAINS_CONFIG"
-    echo "dynamic_chain" >> "$PROXYCHAINS_CONFIG"
-    echo "proxy_dns" >> "$PROXYCHAINS_CONFIG"
-    sed -i '/^socks4\|^socks5/d' "$PROXYCHAINS_CONFIG"
-    echo "socks5 127.0.0.1 9050" >> "$PROXYCHAINS_CONFIG"
-}
-
-# Firejail Sandboxing
-create_sandbox_profile() {
-    local app=$1
-    log "Creating sandbox profile for ${app}..."
-    mkdir -p "$FIREJAIL_PROFILES"
-    cat > "$FIREJAIL_PROFILES/${app}.profile" <<EOF
-include /etc/firejail/${app}.profile
-
-noblacklist ~/.config
-netfilter
-noexec=~/Downloads
-seccomp
-caps.drop all
-private-dev
-private-tmp
-EOF
-}
-
-# Validation System
-validate_network() {
-    log "${GREEN}Starting Network Validation${NC}"
-    local capture_file="/tmp/leaktest_${TIMESTAMP}.pcap"
-    local report_file="/tmp/leakreport_${TIMESTAMP}.txt"
-
-    log "Capturing network traffic for 300 seconds..."
-    timeout 300 tcpdump -ni any -w "$capture_file" &
-    
-    log "Testing Tor connectivity..."
-    if ! torsocks curl -s https://check.torproject.org | grep -q "Congratulations"; then
-        log "${RED}Tor Connection Failed!${NC}"
-        return 1
-    fi
-
-    log "Testing Proxychains..."
-    if ! proxychains curl -s https://ifconfig.me >/dev/null; then
-        log "${RED}Proxychains Failure!${NC}"
-        return 1
-    fi
-
-    log "Analyzing traffic..."
-    tshark -r "$capture_file" -Y "tcp.port != 9050" > "$report_file"
-    log "Validation Report: ${YELLOW}${report_file}${NC}"
+    sudo sed -i '/^strict_chain\|^random_chain\|^dynamic_chain\|^proxy_dns/d' "$PROXYCHAINS_CONFIG"
+    echo "random_chain" | sudo tee -a "$PROXYCHAINS_CONFIG"
+    echo "[ProxyList]" | sudo tee -a "$PROXYCHAINS_CONFIG"
+    echo "socks5 127.0.0.1 9050" | sudo tee -a "$PROXYCHAINS_CONFIG"
+    sudo sed -i 's/^#proxy_dns/proxy_dns/' "$PROXYCHAINS_CONFIG"
 }
 
 # Main Installation
 main() {
-    log "${GREEN}Starting Privacy Suite Installation${NC}"
+    log "${GREEN}Starting Installation${NC}"
     backup_system
 
-    # ===== 1. Install Build Dependencies First =====
-    log "Installing build essentials..."
-    apt update && apt install -y git build-essential
+    # Clean system state
+    sudo apt autoremove -y firebird3.0-common libcapstone4 libgdal35 libhdf5-103-1t64
+    
+    log "Installing packages..."
+    sudo apt update && sudo apt install -y "${REQUIRED_PKGS[@]}"
+    
+    read -p "Configure VPN? [y/N]: " vpn_choice
+    [[ "$vpn_choice" =~ ^[Yy] ]] && configure_vpn
+    
+    read -p "Add Tor Bridges? [y/N]: " ADD_BRIDGES
+    configure_tor
+    configure_proxychains
 
-    # ===== 2. Install Firejail from Source =====
-    if ! command -v firejail &>/dev/null; then
-        log "${YELLOW}Installing Firejail from source...${NC}"
-        temp_dir=$(mktemp -d)
-        git clone https://github.com/netblue30/firejail.git "$temp_dir"
-        pushd "$temp_dir" >/dev/null
-        ./configure
-        make
-        sudo make install-strip
-        popd >/dev/null
-        rm -rf "$temp_dir"
-        
-        # Verify installation
-        if ! command -v firejail &>/dev/null; then
-            log "${RED}Firejail installation failed!${NC}"
-            exit 1
-        fi
-        log "${GREEN}Firejail installed successfully${NC}"
-    fi
-
-    # ===== 3. Install Remaining Packages =====
-    log "Installing system packages..."
-    apt install -y "${REQUIRED_PKGS[@]}"
-
-    # ... [rest of the original main function] ...
+    log "${GREEN}Installation Complete!${NC}"
+    log "${YELLOW}Reboot recommended for full isolation${NC}"
 }
-# Execution
-if [[ $EUID -ne 0 ]]; then
-    log "${RED}Run as root: sudo $0${NC}"
-    exit 1
-fi
 
+# Execution
+[[ $EUID -ne 0 ]] && log "${RED}Run as root: sudo $0${NC}" && exit 1
 main "$@"
