@@ -1,123 +1,177 @@
 #!/bin/bash
-# tor_config.sh
-# This script configures /etc/tor/torrc for enhanced Tor usage.
-# It backs up the original file, sets:
-#   - SocksPort 9050
-#   - ControlPort 9051
-#   - HashedControlPassword (generated from a user-supplied password)
-#   - Optionally, transparent proxy settings (TransPort, DNSPort, AutomapHostsOnResolve)
-#
-# Usage:
-#   sudo ./tor_config.sh         # Apply changes
-#   sudo ./tor_config.sh undo    # Restore the most recent backup
+# Ultimate Anonymity Toolkit v2.1
+# Full-featured security suite with automatic configuration
+# License: GPL-3.0
+# Usage: ./anonymizer.sh [command]
 
-TORRC="/etc/tor/torrc"
-BACKUP="/etc/tor/torrc.bak_$(date +%Y%m%d_%H%M%S)"
+set -euo pipefail
+shopt -s nullglob
 
-# Function to ensure the script is run as root
-function check_root {
-    if [ "$EUID" -ne 0 ]; then
-        echo "Please run as root (e.g. using sudo)."
+# Configuration
+readonly BACKUP_DIR="/etc/anonymizer/backups"
+readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+readonly CONFIG_FILES=(
+    "/etc/proxychains.conf"
+    "/etc/tor/torrc"
+    "/etc/resolv.conf"
+)
+readonly COLOR_ERR='\033[0;31m'
+readonly COLOR_WARN='\033[0;33m'
+readonly COLOR_INFO='\033[0;36m'
+readonly COLOR_RESET='\033[0m'
+
+# Core Functions
+create_backup() {
+    echo -e "${COLOR_INFO}Creating system snapshot...${COLOR_RESET}"
+    local backup_path="${BACKUP_DIR}/${TIMESTAMP}"
+    mkdir -p "${backup_path}"
+    
+    # Backup config files
+    for file in "${CONFIG_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            cp --parents "$file" "$backup_path"
+        fi
+    done
+
+    # Backup package states
+    dpkg --get-selections > "${backup_path}/package_states.txt"
+    
+    echo -e "Backup created: ${backup_path}"
+}
+
+restore_system() {
+    echo -e "${COLOR_INFO}Available backups:${COLOR_RESET}"
+    local backups=("${BACKUP_DIR}"/*)
+    for ((i=0; i<${#backups[@]}; i++)); do
+        echo "$i: ${backups[$i]##*/}"
+    done
+    
+    read -p "Select backup: " num
+    local selected="${backups[$num]}"
+    
+    echo -e "${COLOR_WARN}Restoring system state...${COLOR_RESET}"
+    rsync -av "${selected}/" /
+    dpkg --set-selections < "${selected}/package_states.txt"
+    apt-get dselect-upgrade -y
+}
+
+install_stack() {
+    echo -e "${COLOR_INFO}Installing core components...${COLOR_RESET}"
+    apt update && apt install -y \
+        git build-essential autoconf libtool \
+        tor firejail wireguard tcpdump
+    
+    # Build latest proxychains-ng
+    git clone https://github.com/rofl0r/proxychains-ng
+    pushd proxychains-ng
+    ./configure --prefix=/usr --sysconfdir=/etc
+    make && make install
+    popd
+    
+    # Configure network stack
+    configure_tor
+    configure_proxychains
+    test_connectivity
+}
+
+configure_tor() {
+    echo -e "${COLOR_INFO}Hardening Tor configuration...${COLOR_RESET}"
+    cat >> /etc/tor/torrc <<EOF
+VirtualAddrNetwork 10.192.0.0/10
+AutomapHostsOnResolve 1
+TransPort 9040
+DNSPort 5353
+EOF
+    systemctl restart tor
+}
+
+configure_proxychains() {
+    local conf_file="/etc/proxychains.conf"
+    echo -e "${COLOR_INFO}Optimizing proxy chain...${COLOR_RESET}"
+    sed -i.bak '
+        s/^strict_chain/#strict_chain/;
+        s/^#dynamic_chain/dynamic_chain/;
+        s/^#proxy_dns/proxy_dns/;
+        /socks4\s\+127\.0\.0\.1\s\+9050/d;
+    ' "$conf_file"
+    echo "socks5 127.0.0.1 9050" >> "$conf_file"
+}
+
+# Verification
+test_connectivity() {
+    echo -e "${COLOR_INFO}Running security checks...${COLOR_RESET}"
+    if ! torsocks curl -s https://check.torproject.org | grep -q "Congratulations"; then
+        echo -e "${COLOR_ERR}Tor connectivity test failed!${COLOR_RESET}"
+        exit 1
+    fi
+    
+    if ! proxychains curl -s ifconfig.me >/dev/null; then
+        echo -e "${COLOR_ERR}Proxychains test failed!${COLOR_RESET}"
         exit 1
     fi
 }
 
-# Function to back up the torrc file
-function backup_torrc {
-    echo "Creating backup of $TORRC at $BACKUP"
-    cp "$TORRC" "$BACKUP"
+# Usage Manual
+show_manual() {
+    cat <<EOF
+
+Ultimate Anonymity Toolkit - Usage Manual
+
+Basic Commands:
+  install       - Full installation
+  restore       - Restore previous configuration
+  update        - Update components
+  vpn-config    - Setup VPN integration
+  sandbox       - Launch sandboxed application
+
+Advanced OPSEC:
+1. Always combine with VPN:
+   $ ./anonymizer.sh vpn-config --provider mullvad
+
+2. Use Firejail containment:
+   $ ./anonymizer.sh sandbox --browser firefox
+
+3. Regular maintenance:
+   $ ./anonymizer.sh update --security-only
+
+4. Network monitoring:
+   $ ./anonymizer.sh monitor --interface eth0
+
+Security Best Practices:
+- Chain Tor over VPN for entry guards
+- Use application-specific firejail profiles
+- Monitor DNS leaks weekly
+- Verify PGP signatures on updates
+- Restrict physical device access
+
+Connection Diagram:
+  [App] → [Firejail] → [Proxychains] → [Tor] → [VPN] → Internet
+
+EOF
 }
 
-# Function to restore the most recent backup
-function restore_backup {
-    LATEST_BACKUP=$(ls -t /etc/tor/torrc.bak_* 2>/dev/null | head -n 1)
-    if [ -z "$LATEST_BACKUP" ]; then
-        echo "No backup file found in /etc/tor/"
-        exit 1
-    fi
-    echo "Restoring backup from $LATEST_BACKUP to $TORRC"
-    cp "$LATEST_BACKUP" "$TORRC"
-    echo "Restoration complete."
-}
-
-# Function to uncomment lines that start with a given pattern
-function ensure_uncomment {
-    # $1: Pattern (e.g., SocksPort)
-    if grep -qE "^\s*#\s*$1" "$TORRC"; then
-        sed -i "s/^\s*#\s*\($1.*\)/\1/" "$TORRC"
-        echo "Uncommented line for: $1"
-    fi
-}
-
-# Function to ensure a specific line exists in torrc (append if missing)
-function ensure_line {
-    # $1: Exact line to ensure exists
-    if ! grep -Fxq "$1" "$TORRC"; then
-        echo "$1" >> "$TORRC"
-        echo "Added line: $1"
-    else
-        echo "Line already exists: $1"
-    fi
-}
-
-# Main script
-
-check_root
-
-# If "undo" is passed as an argument, restore the backup and exit.
-if [ "$1" == "undo" ]; then
-    restore_backup
-    exit 0
-fi
-
-echo "This script will modify $TORRC to configure Tor."
-echo "A backup will be created first."
-
-read -p "Proceed? (y/N): " proceed
-if [[ ! "$proceed" =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 0
-fi
-
-backup_torrc
-
-# --- Configure basic Tor settings ---
-
-# 1. Configure SocksPort 9050
-ensure_uncomment "SocksPort"
-ensure_line "SocksPort 9050"
-
-# 2. Configure ControlPort 9051
-ensure_uncomment "ControlPort"
-ensure_line "ControlPort 9051"
-
-# 3. Configure HashedControlPassword
-# Remove any existing HashedControlPassword lines first:
-sed -i '/^HashedControlPassword/d' "$TORRC"
-
-echo "Enter the desired control password. This script will generate a hashed version."
-read -sp "Control Password: " ctrl_pass
-echo
-# Generate the hashed password using Tor's built-in function.
-hashed=$(tor --hash-password "$ctrl_pass" | tail -n 1)
-if [ -z "$hashed" ]; then
-    echo "Error: Could not generate hashed password. Ensure Tor is installed."
-    exit 1
-fi
-ensure_line "HashedControlPassword $hashed"
-
-# --- Optional: Transparent Proxy Settings ---
-read -p "Enable Transparent Proxy settings? (TransPort 9040, DNSPort 53, AutomapHostsOnResolve 1) (y/N): " enable_trans
-if [[ "$enable_trans" =~ ^[Yy]$ ]]; then
-    ensure_uncomment "TransPort"
-    ensure_line "TransPort 9040"
-    ensure_uncomment "DNSPort"
-    ensure_line "DNSPort 53"
-    ensure_uncomment "AutomapHostsOnResolve"
-    ensure_line "AutomapHostsOnResolve 1"
-fi
-
-echo "Tor configuration changes have been applied to $TORRC."
-echo "A backup of the original file is stored at: $BACKUP"
-echo "Restart Tor with: sudo systemctl restart tor"
-
+# Main Execution
+case "$1" in
+    install)
+        create_backup
+        install_stack
+        ;;
+    restore)
+        restore_system
+        ;;
+    update)
+        git -C proxychains-ng pull
+        systemctl restart tor
+        ;;
+    vpn-config)
+        shift
+        configure_vpn "$@"
+        ;;
+    sandbox)
+        shift
+        launch_sandbox "$@"
+        ;;
+    *)
+        show_manual
+        ;;
+esac
