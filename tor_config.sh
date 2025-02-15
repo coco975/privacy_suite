@@ -151,7 +151,7 @@ EOF
 }
 
 # Main Execution
-case "$1" in
+case "${1:-}" in
     install)
         create_backup
         install_stack
